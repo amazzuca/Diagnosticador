@@ -96,7 +96,7 @@ def health():
 
 
 STATIC = Path(__file__).parent / "static"
-AGENCY = os.getenv("AGENCY_NAME", "Tu Agencia")
+AGENCY = os.getenv("AGENCY_NAME", "")
 
 
 def _logo_html() -> str:
