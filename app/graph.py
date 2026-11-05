@@ -8,10 +8,15 @@ Flujo por cada mensaje del usuario:
                                       │
                                       └► report ─► END   (genera diagnóstico + webhook n8n)
 
+Webhook a n8n (campo "evento"):
+  - "contacto_capturado": apenas el usuario deja mail o teléfono (no se pierde el lead si abandona)
+  - "diagnostico": al terminar la entrevista, con el informe completo
 El estado se persiste por thread_id con un checkpointer (memoria o Postgres).
 """
 import json
+import logging
 import os
+import re
 from typing import Annotated, Literal, Optional, TypedDict
 
 import httpx
@@ -21,20 +26,24 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field, create_model
 
+logger = logging.getLogger("diagnosticador")
+
 MODEL = os.getenv("MODEL", "openai:gpt-4o-mini")
 MAX_TURNS = int(os.getenv("MAX_TURNS", "20"))
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
-AGENCY_NAME = os.getenv("AGENCY_NAME", "nuestra agencia")
 N8N_WEBHOOK_TOKEN = os.getenv("N8N_WEBHOOK_TOKEN", "")
+AGENCY_NAME = os.getenv("AGENCY_NAME", "nuestra agencia")
 
-llm = init_chat_model(MODEL, temperature=0.3)
+llm = init_chat_model(MODEL, temperature=0.3, timeout=60, max_retries=3)
 
 # ---------------------------------------------------------------------------
-# Campos que el bot necesita relevar (orden = prioridad de preguntas)
+# Campos que el bot necesita relevar (orden = prioridad de preguntas).
+# El contacto va 3º a propósito: si el usuario abandona, el lead ya está capturado.
 # ---------------------------------------------------------------------------
 FIELDS = [
     ("empresa", "Nombre de la empresa, rubro y tamaño (cantidad de empleados)"),
     ("proceso", "Qué proceso quiere automatizar y cuál es el objetivo"),
+    ("contacto", "Nombre y cargo de la persona de contacto, junto con su mail y su teléfono/WhatsApp"),
     ("pasos", "Pasos actuales del proceso, de principio a fin, y quién hace cada uno"),
     ("disparador_frecuencia", "Qué dispara el proceso y con qué frecuencia/volumen (por día, semana o mes)"),
     ("tiempo_costo", "Tiempo que toma cada ejecución, cuántas personas intervienen y costo aproximado"),
@@ -45,7 +54,6 @@ FIELDS = [
     ("accesos_apis", "Si los sistemas tienen API, exportaciones o acceso a base de datos; quién administra los accesos"),
     ("datos_sensibles", "Datos sensibles o requisitos de seguridad/cumplimiento"),
     ("exito_plazo", "Cómo medirían el éxito (KPI), plazo y presupuesto estimado"),
-    ("contacto", "Nombre, cargo y mail o WhatsApp de contacto"),
 ]
 TOTAL = len(FIELDS)
 
@@ -55,6 +63,8 @@ Extraction = create_model(
         bool,
         Field(default=False, description="True solo si el usuario pide explícitamente terminar o recibir ya el diagnóstico"),
     ),
+    email=(Optional[str], Field(default=None, description="Email de contacto, copiado tal como lo escribió el usuario")),
+    telefono=(Optional[str], Field(default=None, description="Teléfono o WhatsApp de contacto, copiado tal como lo escribió el usuario")),
     **{k: (Optional[str], Field(default=None, description=d)) for k, d in FIELDS},
 )
 
@@ -77,6 +87,7 @@ Leé la conversación y completá SOLO los campos sobre los que el usuario aport
 
 Reglas:
 - No inventes ni infieras datos que el usuario no dijo.
+- email y telefono: copialos exactamente como los escribió el usuario. Si no los dio, null.
 - Si un campo ya tiene valor y el usuario agrega detalle, devolvé el valor combinado y actualizado.
 - Si el usuario dice que no sabe o prefiere no responder sobre algo que se le preguntó, poné "No informado" en ese campo.
 - Dejá en null lo que no se mencionó.
@@ -95,6 +106,7 @@ Reglas:
 - Si es el primer mensaje, presentate en una línea, aclará que son unos 10 minutos de preguntas y empezá.
 - Si la respuesta anterior fue vaga, pedí un ejemplo concreto o un número aproximado.
 - Aceptá "no sé" como respuesta válida y seguí adelante.
+- Si el tema es el contacto, explicá en una frase que es para enviarle el diagnóstico y que un consultor lo contacte; pedí nombre, mail y WhatsApp o teléfono.
 - NO des recomendaciones ni soluciones todavía. NO menciones campos internos ni listas.
 
 Tema a cubrir ahora: {next_topic}
@@ -119,7 +131,7 @@ Reglas:
 
 
 # ---------------------------------------------------------------------------
-# Estado y nodos
+# Estado y utilidades
 # ---------------------------------------------------------------------------
 class State(TypedDict, total=False):
     messages: Annotated[list, add_messages]
@@ -127,13 +139,76 @@ class State(TypedDict, total=False):
     turns: int
     close: bool
     done: bool
+    lead_sent: bool
+
+
+def _filled(data: dict, key: str) -> bool:
+    """El contacto se considera completo si hay mail o teléfono (o si el usuario no quiso darlo)."""
+    if key == "contacto":
+        return bool(data.get("email") or data.get("telefono") or str(data.get("contacto", "")).lower() == "no informado")
+    return bool(data.get(key))
 
 
 def _missing(data: dict):
-    return [(k, d) for k, d in FIELDS if not data.get(k)]
+    return [(k, d) for k, d in FIELDS if not _filled(data, k)]
 
 
-def extract(state: State):
+EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+PHONE_RE = re.compile(r"\+?\d[\d\s().-]{6,}\d")
+PHONE_HINT = re.compile(r"tel|cel|whats|wsp|wpp|m[oó]vil|llam", re.I)
+
+
+def _regex_contact(state: State, data: dict):
+    """Respaldo determinista: no dependemos solo del LLM para capturar mail y teléfono."""
+    text = state["messages"][-1].content
+    if not isinstance(text, str):
+        return
+    m = EMAIL_RE.search(text)
+    if m:
+        data["email"] = m.group(0)
+    if not data.get("telefono"):
+        asking_contact = any(k == "contacto" for k, _ in _missing(data)[:2])
+        for m in PHONE_RE.finditer(text):
+            raw = m.group(0).strip()
+            digits = re.sub(r"\D", "", raw)
+            if 8 <= len(digits) <= 15 and (asking_contact or raw.startswith("+") or PHONE_HINT.search(text)):
+                data["telefono"] = raw
+                break
+
+
+def _post_webhook(payload: dict):
+    """Envía a n8n. Nunca rompe la conversación, pero SIEMPRE deja rastro en los logs."""
+    if not N8N_WEBHOOK_URL:
+        logger.warning("N8N_WEBHOOK_URL no está configurada: no se envía evento=%s", payload.get("evento"))
+        return
+    headers = {"X-Auth-Token": N8N_WEBHOOK_TOKEN} if N8N_WEBHOOK_TOKEN else {}
+    try:
+        r = httpx.post(N8N_WEBHOOK_URL, json=payload, headers=headers, timeout=10)
+        r.raise_for_status()
+        logger.info("Webhook n8n OK evento=%s status=%s", payload.get("evento"), r.status_code)
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "Webhook n8n FALLÓ evento=%s status=%s body=%s",
+            payload.get("evento"), exc.response.status_code, exc.response.text[:200],
+        )
+    except Exception as exc:
+        logger.error("Webhook n8n FALLÓ evento=%s error=%s", payload.get("evento"), exc)
+
+
+def _base_payload(evento: str, thread_id, data: dict) -> dict:
+    return {
+        "evento": evento,
+        "thread_id": thread_id,
+        "email": data.get("email"),
+        "telefono": data.get("telefono"),
+        "datos": data,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Nodos
+# ---------------------------------------------------------------------------
+def extract(state: State, config):
     data = dict(state.get("data") or {})
     system = SystemMessage(EXTRACT_SYSTEM.format(data=json.dumps(data, ensure_ascii=False)))
     result = llm.with_structured_output(Extraction).invoke([system] + state["messages"][-8:])
@@ -142,7 +217,15 @@ def extract(state: State):
     for k, v in update.items():
         if v and str(v).strip():
             data[k] = str(v).strip()
-    return {"data": data, "close": close, "turns": state.get("turns", 0) + 1}
+    _regex_contact(state, data)
+
+    out = {"data": data, "close": close, "turns": state.get("turns", 0) + 1}
+
+    # Lead capturado: avisamos a n8n ya, sin esperar al final de la entrevista.
+    if (data.get("email") or data.get("telefono")) and not state.get("lead_sent"):
+        _post_webhook(_base_payload("contacto_capturado", config["configurable"].get("thread_id"), data))
+        out["lead_sent"] = True
+    return out
 
 
 def route_after_extract(state: State) -> Literal["ask", "report"]:
@@ -175,25 +258,15 @@ def report(state: State, config):
     diag: Diagnostico = llm.with_structured_output(Diagnostico).invoke([system, brief])
 
     text = diag.resumen_cliente
-    if data.get("contacto") and data["contacto"].lower() != "no informado":
+    if data.get("email") or data.get("telefono"):
         text += f"\n\n---\nUn consultor de {AGENCY_NAME} te va a contactar para coordinar los próximos pasos. ¡Gracias por tu tiempo!"
     else:
         text += f"\n\n---\nSi querés avanzar, escribinos y coordinamos una reunión con {AGENCY_NAME}. ¡Gracias por tu tiempo!"
 
-    _notify(config["configurable"].get("thread_id"), data, diag)
+    payload = _base_payload("diagnostico", config["configurable"].get("thread_id"), data)
+    payload.update(diag.model_dump())
+    _post_webhook(payload)
     return {"messages": [AIMessage(content=text)], "done": True}
-
-
-def _notify(thread_id, data: dict, diag: Diagnostico):
-    """Envía el informe interno a un webhook de n8n (falla en silencio)."""
-    if not N8N_WEBHOOK_URL:
-        return
-    payload = {"thread_id": thread_id, "datos": data, **diag.model_dump()}
-    headers = {"X-Auth-Token": N8N_WEBHOOK_TOKEN} if N8N_WEBHOOK_TOKEN else {}
-    try:
-        httpx.post(N8N_WEBHOOK_URL, json=payload, headers=headers, timeout=10)
-    except Exception as exc:  # no romper la conversación por un webhook caído
-        print(f"[notify] webhook error: {exc}")
 
 
 def after(state: State):
@@ -207,7 +280,7 @@ def gate(state: State) -> Literal["after", "extract"]:
 
 def progress(state: dict) -> float:
     data = state.get("data") or {}
-    return round(sum(1 for k, _ in FIELDS if data.get(k)) / TOTAL, 2)
+    return round(sum(1 for k, _ in FIELDS if _filled(data, k)) / TOTAL, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +296,7 @@ def make_checkpointer():
             conninfo=url,
             max_size=5,
             kwargs={"autocommit": True, "prepare_threshold": 0},
+            check=ConnectionPool.check_connection,
             open=True,
         )
         saver = PostgresSaver(pool)

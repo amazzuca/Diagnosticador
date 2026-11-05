@@ -89,6 +89,8 @@ def health():
         "api_key_set": bool(os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")),
         "checkpointer": "postgres" if os.getenv("DATABASE_URL") else "memory",
         "n8n_webhook_set": bool(os.getenv("N8N_WEBHOOK_URL")),
+        "n8n_token_set": bool(os.getenv("N8N_WEBHOOK_TOKEN")),
+        "n8n_url_is_test": "/webhook-test/" in os.getenv("N8N_WEBHOOK_URL", ""),
     }
 
 
