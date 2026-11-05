@@ -1,59 +1,143 @@
-<!doctype html>
-<html lang="es">
+<!DOCTYPE html>
+<html lang="es" data-theme="light">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Diagnóstico de automatización</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>__AGENCY__ · Diagnóstico de automatización</title>
+<script>
+  // Aplica el tema guardado antes de pintar (evita el destello)
+  try { document.documentElement.setAttribute("data-theme", localStorage.getItem("bot-theme") || "light"); } catch (_) {}
+</script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root { --bg:#f6f7f9; --card:#fff; --text:#1c1f23; --muted:#6b7280; --accent:#2563eb; --bot:#eef1f6; --user:#2563eb; --border:#e5e7eb; }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg:#0f1115; --card:#171a21; --text:#e8eaed; --muted:#9aa3b2; --accent:#3b82f6; --bot:#222733; --user:#3b82f6; --border:#2a2f3a; }
-  }
-  * { box-sizing: border-box; }
-  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--text); height:100dvh; display:flex; justify-content:center; }
-  .app { width:100%; max-width:760px; display:flex; flex-direction:column; height:100dvh; background:var(--card); border-left:1px solid var(--border); border-right:1px solid var(--border); }
-  header { padding:14px 18px; border-bottom:1px solid var(--border); }
-  header h1 { font-size:16px; margin:0 0 8px; }
-  .bar { height:6px; background:var(--bot); border-radius:99px; overflow:hidden; }
-  .bar > div { height:100%; width:0; background:var(--accent); transition:width .4s; }
-  #label { font-size:12px; color:var(--muted); margin-top:4px; }
-  #chat { flex:1; overflow-y:auto; padding:18px; display:flex; flex-direction:column; gap:12px; }
-  .msg { max-width:85%; padding:10px 14px; border-radius:14px; line-height:1.5; font-size:15px; overflow-wrap:anywhere; }
-  .msg p { margin:0 0 8px; } .msg p:last-child { margin:0; }
-  .msg.bot { background:var(--bot); align-self:flex-start; border-bottom-left-radius:4px; }
-  .msg.user { background:var(--user); color:#fff; align-self:flex-end; border-bottom-right-radius:4px; }
-  .typing { color:var(--muted); font-style:italic; }
-  form { display:flex; gap:8px; padding:12px 14px; border-top:1px solid var(--border); padding-bottom:max(12px, env(safe-area-inset-bottom)); }
-  textarea { flex:1; resize:none; font:inherit; padding:10px 12px; border-radius:10px; border:1px solid var(--border); background:var(--bg); color:var(--text); max-height:120px; }
-  button { font:inherit; padding:0 18px; border:0; border-radius:10px; background:var(--accent); color:#fff; cursor:pointer; }
-  button:disabled, textarea:disabled { opacity:.5; cursor:not-allowed; }
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#f0f2f6;--surface:#ffffff;--surface2:#f7f8fc;
+  --border:#e2e6f0;--border2:#c8d0e4;
+  --accent:#4f46e5;--accent2:#6366f1;--accent-light:#eef2ff;
+  --text:#111827;--text2:#4b5563;--text3:#9ca3af;
+  --red:#dc2626;--amber:#d97706;--green:#16a34a;--blue:#2563eb;
+  --sh:0 1px 3px rgba(0,0,0,.07),0 2px 8px rgba(0,0,0,.05);
+  --sh2:0 4px 20px rgba(0,0,0,.1);
+}
+[data-theme=dark]{
+  --bg:#0f1117;--surface:#1a1f2e;--surface2:#222840;
+  --border:#2a3350;--border2:#374060;
+  --accent:#6366f1;--accent2:#818cf8;--accent-light:#1e1b4b;
+  --text:#f1f5f9;--text2:#94a3b8;--text3:#475569;
+  --red:#f87171;--amber:#fbbf24;--green:#4ade80;--blue:#60a5fa;
+  --sh:0 2px 8px rgba(0,0,0,.4);--sh2:0 8px 32px rgba(0,0,0,.4);
+}
+body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);height:100dvh;font-size:14px;line-height:1.5;display:flex;flex-direction:column}
+
+/* ── ENCABEZADO (mismo formato que ProPulse) ── */
+.topbar{background:var(--surface);border-bottom:1px solid var(--border);height:54px;padding:0 20px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:40;flex-shrink:0}
+.topbar-logo{font-size:18px;font-weight:700;letter-spacing:-.5px;color:var(--text)}
+.topbar-logo span{color:var(--accent)}
+.topbar-right{display:flex;align-items:center;gap:8px}
+.sync{font-size:11px;padding:3px 10px;border-radius:20px;font-weight:500;white-space:nowrap}
+.sync.ok{background:rgba(22,163,74,.1);color:var(--green);border:1px solid rgba(22,163,74,.2)}
+.sync.saving{background:rgba(217,119,6,.1);color:var(--amber);border:1px solid rgba(217,119,6,.2)}
+.sync.err{background:rgba(220,38,38,.1);color:var(--red);border:1px solid rgba(220,38,38,.2)}
+.icon-btn{height:34px;border-radius:20px;border:1px solid var(--border);background:var(--surface2);cursor:pointer;display:flex;align-items:center;justify-content:center;gap:5px;font-size:13px;font-weight:500;font-family:inherit;color:var(--text2);padding:0 12px;transition:all .15s;white-space:nowrap}
+.icon-btn:hover{border-color:var(--border2)}
+.nav{background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 16px;overflow-x:auto;flex-shrink:0}
+.nav::-webkit-scrollbar{display:none}
+.nav-btn{padding:14px 16px;font-size:13px;font-weight:500;border:none;background:none;cursor:default;color:var(--text3);border-bottom:2px solid transparent;white-space:nowrap;font-family:inherit;display:flex;align-items:center;gap:5px}
+.nav-btn.on{color:var(--accent);border-bottom-color:var(--accent)}
+.nav-right{margin-left:auto;padding-left:12px;font-size:12px;color:var(--text3);white-space:nowrap}
+.pbar{height:3px;background:var(--border);flex-shrink:0}
+.pbar>div{height:100%;width:0;background:var(--accent);transition:width .4s}
+
+/* ── CONTENIDO ── */
+.content{flex:1;min-height:0;width:100%;max-width:860px;margin:0 auto;padding:20px;display:flex}
+.card{flex:1;min-height:0;display:flex;flex-direction:column;background:var(--surface);border:1px solid var(--border);border-radius:14px;box-shadow:var(--sh);overflow:hidden}
+#chat{flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:12px}
+.msg{max-width:85%;padding:10px 14px;border-radius:14px;line-height:1.55;font-size:14px;overflow-wrap:anywhere}
+.msg p{margin:0 0 8px}.msg p:last-child{margin:0}
+.msg ul,.msg ol{margin:0 0 8px 18px}
+.msg h1,.msg h2,.msg h3{font-size:15px;margin:10px 0 6px}
+.msg.bot{background:var(--surface2);border:1px solid var(--border);align-self:flex-start;border-bottom-left-radius:4px}
+.msg.user{background:var(--accent);color:#fff;align-self:flex-end;border-bottom-right-radius:4px}
+.typing{color:var(--text3);font-style:italic}
+.err small{display:block;margin-top:6px;color:var(--text3)}
+.msg .btn{margin-top:8px}
+form{display:flex;gap:8px;padding:12px 14px;border-top:1px solid var(--border);background:var(--surface)}
+textarea{flex:1;resize:none;padding:9px 12px;border:1px solid var(--border);border-radius:8px;font-size:13px;background:var(--surface2);color:var(--text);font-family:inherit;max-height:120px;transition:border .15s}
+textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.1)}
+textarea::placeholder{color:var(--text3)}
+.btn{padding:8px 16px;border-radius:8px;border:1px solid var(--border2);background:var(--surface2);cursor:pointer;font-size:13px;font-weight:500;color:var(--text);font-family:inherit;display:inline-flex;align-items:center;gap:6px;transition:all .15s;white-space:nowrap}
+.btn:hover{border-color:var(--accent);color:var(--accent)}
+.btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.btn.primary:hover{background:var(--accent2);border-color:var(--accent2);color:#fff}
+.btn:disabled,textarea:disabled{opacity:.5;cursor:not-allowed}
+
+@media (max-width:520px){
+  .topbar{padding:0 12px}
+  #theme-label{display:none}
+  .content{padding:10px}
+  .nav-right{display:none}
+}
 </style>
 </head>
 <body>
-<div class="app">
-  <header>
-    <h1>Diagnóstico de automatización</h1>
-    <div class="bar"><div id="bar"></div></div>
-    <div id="label">Iniciando…</div>
-  </header>
-  <div id="chat"></div>
-  <form id="form">
-    <textarea id="input" rows="1" placeholder="Escribí tu respuesta…" disabled></textarea>
-    <button id="btn" disabled>Enviar</button>
-  </form>
-</div>
+  <div class="topbar">
+    <div class="topbar-logo">__LOGO__</div>
+    <div class="topbar-right">
+      <span id="sync" class="sync saving">● Conectando…</span>
+      <button class="icon-btn" type="button" onclick="toggleTheme()" id="theme-btn"><span id="theme-icon">🌙</span><span id="theme-label">Oscuro</span></button>
+    </div>
+  </div>
+  <div class="nav">
+    <button class="nav-btn on" type="button" tabindex="-1">🤖 Diagnóstico de automatización</button>
+    <span class="nav-right" id="label">Iniciando…</span>
+  </div>
+  <div class="pbar"><div id="bar"></div></div>
+
+  <div class="content">
+    <div class="card">
+      <div id="chat"></div>
+      <form id="form">
+        <textarea id="input" rows="1" placeholder="Escribí tu respuesta…" disabled></textarea>
+        <button class="btn primary" id="btn" disabled>Enviar</button>
+      </form>
+    </div>
+  </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
 <script>
   const API = ""; // mismo origen. Si lo embebés en otro sitio: "https://tu-app.onrender.com"
   const threadId = crypto.randomUUID();
+  const RETRY_DELAYS = [0, 4000, 10000, 20000]; // ms entre intentos (cubre el arranque en frío de Render)
+  const REQUEST_TIMEOUT = 90000;               // ms por intento
   const chat = document.getElementById("chat");
   const form = document.getElementById("form");
   const input = document.getElementById("input");
   const btn = document.getElementById("btn");
   const bar = document.getElementById("bar");
   const label = document.getElementById("label");
+  const syncEl = document.getElementById("sync");
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // ── Tema claro/oscuro (como ProPulse) ──
+  function applyTheme(t) {
+    document.documentElement.setAttribute("data-theme", t);
+    document.getElementById("theme-icon").textContent = t === "dark" ? "☀️" : "🌙";
+    document.getElementById("theme-label").textContent = t === "dark" ? "Claro" : "Oscuro";
+  }
+  function toggleTheme() {
+    const n = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+    try { localStorage.setItem("bot-theme", n); } catch (_) {}
+    applyTheme(n);
+  }
+  applyTheme(document.documentElement.getAttribute("data-theme") || "light");
+
+  // ── Indicador de estado (pill verde / ámbar / rojo) ──
+  function setSync(state, text) {
+    syncEl.className = "sync " + state;
+    syncEl.textContent = "● " + text;
+  }
 
   function add(role, text) {
     const d = document.createElement("div");
@@ -67,28 +151,87 @@
 
   function setBusy(b) { input.disabled = b; btn.disabled = b; }
 
-  async function send(text, silent = false) {
-    if (!silent) add("user", text);
-    const typing = add("bot", "Escribiendo…");
-    typing.classList.add("typing");
-    setBusy(true);
-    let done = false;
+  // Un intento con timeout. Devuelve el JSON o lanza un Error con .status / .fatal
+  async function attempt(text, msgId) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT);
     try {
       const r = await fetch(API + "/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ thread_id: threadId, message: text }),
+        body: JSON.stringify({ thread_id: threadId, message: text, message_id: msgId }),
+        signal: ctrl.signal,
       });
-      if (!r.ok) throw new Error(r.status);
-      const j = await r.json();
+      if (r.ok) return await r.json();
+      let detail = "";
+      try { detail = (await r.json()).detail || ""; } catch (_) {}
+      const err = new Error(detail || "HTTP " + r.status);
+      err.status = r.status;
+      err.fatal = [400, 422, 429].includes(r.status); // reintentar no sirve
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // Reintenta con espera creciente (Render free tarda ~1 min en despertar)
+  async function callChat(text, msgId, typing) {
+    let lastErr;
+    for (let i = 0; i < RETRY_DELAYS.length; i++) {
+      if (RETRY_DELAYS[i]) {
+        typing.textContent = `Reconectando… (intento ${i + 1}/${RETRY_DELAYS.length})`;
+        setSync("saving", "Reconectando…");
+        await sleep(RETRY_DELAYS[i]);
+      }
+      try {
+        return await attempt(text, msgId);
+      } catch (e) {
+        lastErr = e;
+        if (e.fatal) throw e;
+        console.warn("Intento", i + 1, "falló:", e.status || e.name, e.message);
+      }
+    }
+    throw lastErr;
+  }
+
+  function showError(e, text, msgId, silent) {
+    let msg = "No pude comunicarme con el servidor.";
+    if (e.status === 429) msg = "Se alcanzó el límite de mensajes por hora. Probá más tarde.";
+    else if (e.status >= 500) msg = "El servidor tuvo un problema procesando tu mensaje.";
+    const d = add("bot", msg);
+    d.classList.add("err");
+    const s = document.createElement("small");
+    s.textContent = "Detalle: " + (e.status ? "HTTP " + e.status + " – " : "") + (e.message || e.name);
+    d.appendChild(s);
+    if (e.status !== 429) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "btn primary";
+      b.textContent = "Reintentar";
+      b.onclick = () => { d.remove(); send(text, { silent, id: msgId, retry: true }); };
+      d.appendChild(b);
+    }
+  }
+
+  async function send(text, { silent = false, id = crypto.randomUUID(), retry = false } = {}) {
+    if (!silent && !retry) add("user", text);
+    const typing = add("bot", "Escribiendo…");
+    typing.classList.add("typing");
+    setBusy(true);
+    setSync("saving", "Pensando…");
+    let done = false;
+    try {
+      const j = await callChat(text, id, typing);
       typing.remove();
       add("bot", j.reply);
       bar.style.width = Math.round(j.progress * 100) + "%";
       label.textContent = j.done ? "Diagnóstico completo" : "Información relevada: " + Math.round(j.progress * 100) + "%";
+      setSync("ok", j.done ? "Completo" : "Conectado");
       done = j.done;
     } catch (e) {
       typing.remove();
-      add("bot", "Hubo un problema de conexión. Probá de nuevo en unos segundos.");
+      setSync("err", "Sin conexión");
+      showError(e, text, id, silent);
     }
     if (done) { input.placeholder = "Entrevista finalizada"; return; }
     setBusy(false);
@@ -106,8 +249,9 @@
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
   });
 
-  // El bot inicia la conversación (el primer request puede tardar ~1 min si Render estaba dormido)
-  send("Hola", true);
+  // Despierta el servicio de Render apenas carga la página y arranca la entrevista
+  fetch(API + "/health").catch(() => {});
+  send("Hola", { silent: true });
 </script>
 </body>
 </html>
