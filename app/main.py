@@ -1,3 +1,4 @@
+import html as _html
 import logging
 import os
 import time
@@ -7,7 +8,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
@@ -95,8 +96,26 @@ def health():
 
 
 STATIC = Path(__file__).parent / "static"
+AGENCY = os.getenv("AGENCY_NAME", "Tu Agencia")
+
+
+def _logo_html() -> str:
+    """Logo bicolor como ProPulse ("Pro" + "Pulse" en color de acento).
+    BRAND_LOGO="Auto|matizar" marca el corte; si no está, se corta en la última palabra de AGENCY_NAME."""
+    raw = (os.getenv("BRAND_LOGO") or AGENCY).strip()
+    if "|" in raw:
+        a, b = raw.split("|", 1)
+    elif " " in raw:
+        a, b = raw.rsplit(" ", 1)
+        a += " "
+    else:
+        a, b = raw, ""
+    out = _html.escape(a)
+    return out + (f"<span>{_html.escape(b)}</span>" if b else "")
 
 
 @app.get("/")
 def index():
-    return FileResponse(STATIC / "index.html")
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    page = page.replace("__LOGO__", _logo_html()).replace("__AGENCY__", _html.escape(AGENCY))
+    return HTMLResponse(page)
