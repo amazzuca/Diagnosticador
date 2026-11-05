@@ -25,6 +25,7 @@ MODEL = os.getenv("MODEL", "openai:gpt-4o-mini")
 MAX_TURNS = int(os.getenv("MAX_TURNS", "20"))
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
 AGENCY_NAME = os.getenv("AGENCY_NAME", "nuestra agencia")
+N8N_WEBHOOK_TOKEN = os.getenv("N8N_WEBHOOK_TOKEN", "")
 
 llm = init_chat_model(MODEL, temperature=0.3)
 
