@@ -188,8 +188,9 @@ def _notify(thread_id, data: dict, diag: Diagnostico):
     if not N8N_WEBHOOK_URL:
         return
     payload = {"thread_id": thread_id, "datos": data, **diag.model_dump()}
+    headers = {"X-Auth-Token": N8N_WEBHOOK_TOKEN} if N8N_WEBHOOK_TOKEN else {}
     try:
-        httpx.post(N8N_WEBHOOK_URL, json=payload, timeout=10)
+        httpx.post(N8N_WEBHOOK_URL, json=payload, headers=headers, timeout=10)
     except Exception as exc:  # no romper la conversación por un webhook caído
         print(f"[notify] webhook error: {exc}")
 
