@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diagnóstico de automatización</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c1f23; --muted:#6b7280; --accent:#2563eb; --bot:#eef1f6; --user:#2563eb; --border:#e5e7eb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1115; --card:#171a21; --text:#e8eaed; --muted:#9aa3b2; --accent:#3b82f6; --bot:#222733; --user:#3b82f6; --border:#2a2f3a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--text); height:100dvh; display:flex; justify-content:center; }
+  .app { width:100%; max-width:760px; display:flex; flex-direction:column; height:100dvh; background:var(--card); border-left:1px solid var(--border); border-right:1px solid var(--border); }
+  header { padding:14px 18px; border-bottom:1px solid var(--border); }
+  header h1 { font-size:16px; margin:0 0 8px; }
+  .bar { height:6px; background:var(--bot); border-radius:99px; overflow:hidden; }
+  .bar > div { height:100%; width:0; background:var(--accent); transition:width .4s; }
+  #label { font-size:12px; color:var(--muted); margin-top:4px; }
+  #chat { flex:1; overflow-y:auto; padding:18px; display:flex; flex-direction:column; gap:12px; }
+  .msg { max-width:85%; padding:10px 14px; border-radius:14px; line-height:1.5; font-size:15px; overflow-wrap:anywhere; }
+  .msg p { margin:0 0 8px; } .msg p:last-child { margin:0; }
+  .msg.bot { background:var(--bot); align-self:flex-start; border-bottom-left-radius:4px; }
+  .msg.user { background:var(--user); color:#fff; align-self:flex-end; border-bottom-right-radius:4px; }
+  .typing { color:var(--muted); font-style:italic; }
+  form { display:flex; gap:8px; padding:12px 14px; border-top:1px solid var(--border); padding-bottom:max(12px, env(safe-area-inset-bottom)); }
+  textarea { flex:1; resize:none; font:inherit; padding:10px 12px; border-radius:10px; border:1px solid var(--border); background:var(--bg); color:var(--text); max-height:120px; }
+  button { font:inherit; padding:0 18px; border:0; border-radius:10px; background:var(--accent); color:#fff; cursor:pointer; }
+  button:disabled, textarea:disabled { opacity:.5; cursor:not-allowed; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>Diagnóstico de automatización</h1>
+    <div class="bar"><div id="bar"></div></div>
+    <div id="label">Iniciando…</div>
+  </header>
+  <div id="chat"></div>
+  <form id="form">
+    <textarea id="input" rows="1" placeholder="Escribí tu respuesta…" disabled></textarea>
+    <button id="btn" disabled>Enviar</button>
+  </form>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
+<script>
+  const API = ""; // mismo origen. Si lo embebés en otro sitio: "https://tu-app.onrender.com"
+  const threadId = crypto.randomUUID();
+  const chat = document.getElementById("chat");
+  const form = document.getElementById("form");
+  const input = document.getElementById("input");
+  const btn = document.getElementById("btn");
+  const bar = document.getElementById("bar");
+  const label = document.getElementById("label");
+
+  function add(role, text) {
+    const d = document.createElement("div");
+    d.className = "msg " + role;
+    if (role === "bot") d.innerHTML = DOMPurify.sanitize(marked.parse(text));
+    else d.textContent = text;
+    chat.appendChild(d);
+    chat.scrollTop = chat.scrollHeight;
+    return d;
+  }
+
+  function setBusy(b) { input.disabled = b; btn.disabled = b; }
+
+  async function send(text, silent = false) {
+    if (!silent) add("user", text);
+    const typing = add("bot", "Escribiendo…");
+    typing.classList.add("typing");
+    setBusy(true);
+    let done = false;
+    try {
+      const r = await fetch(API + "/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ thread_id: threadId, message: text }),
+      });
+      if (!r.ok) throw new Error(r.status);
+      const j = await r.json();
+      typing.remove();
+      add("bot", j.reply);
+      bar.style.width = Math.round(j.progress * 100) + "%";
+      label.textContent = j.done ? "Diagnóstico completo" : "Información relevada: " + Math.round(j.progress * 100) + "%";
+      done = j.done;
+    } catch (e) {
+      typing.remove();
+      add("bot", "Hubo un problema de conexión. Probá de nuevo en unos segundos.");
+    }
+    if (done) { input.placeholder = "Entrevista finalizada"; return; }
+    setBusy(false);
+    input.focus();
+  }
+
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const t = input.value.trim();
+    if (!t) return;
+    input.value = "";
+    send(t);
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
+  });
+
+  // El bot inicia la conversación (el primer request puede tardar ~1 min si Render estaba dormido)
+  send("Hola", true);
+</script>
+</body>
+</html>

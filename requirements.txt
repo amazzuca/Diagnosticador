@@ -1,0 +1,11 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+httpx>=0.27
+pydantic>=2.7
+langgraph>=0.6
+langchain>=0.3
+langchain-openai>=0.3
+langchain-anthropic>=0.3
+# Opcional: persistencia en Postgres (solo se usa si definís DATABASE_URL)
+langgraph-checkpoint-postgres>=2.0
+psycopg[binary,pool]>=3.2

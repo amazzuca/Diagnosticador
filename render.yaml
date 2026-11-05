@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: diagnosticador-automatizacion
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: MODEL
+        value: openai:gpt-4o-mini
+      - key: AGENCY_NAME
+        value: Tu Agencia
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: N8N_WEBHOOK_URL
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
