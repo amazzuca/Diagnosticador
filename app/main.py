@@ -1,7 +1,9 @@
+import logging
 import os
 import time
 from collections import defaultdict, deque
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +11,10 @@ from fastapi.responses import FileResponse
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
-from .graph import build_graph, progress
+from .graph import MODEL, build_graph, progress
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("diagnosticador")
 
 graph = build_graph()
 
@@ -43,6 +48,8 @@ def _limited(ip: str) -> bool:
 class ChatIn(BaseModel):
     thread_id: str = Field(min_length=8, max_length=64)
     message: str = Field(min_length=1, max_length=2000)
+    # Id idempotente: si el cliente reintenta el mismo mensaje, LangGraph lo deduplica.
+    message_id: Optional[str] = Field(default=None, max_length=64)
 
 
 def _text(content) -> str:
@@ -57,7 +64,15 @@ def chat(body: ChatIn, request: Request):
     if _limited(ip):
         raise HTTPException(429, "Demasiadas solicitudes. Probá más tarde.")
     config = {"configurable": {"thread_id": body.thread_id}}
-    out = graph.invoke({"messages": [HumanMessage(body.message)]}, config)
+    try:
+        out = graph.invoke(
+            {"messages": [HumanMessage(content=body.message, id=body.message_id)]},
+            config,
+        )
+    except Exception as exc:
+        # El traceback completo queda en los logs de Render.
+        logger.exception("Error en /chat thread=%s", body.thread_id)
+        raise HTTPException(502, f"Error interno ({type(exc).__name__}). Revisá los logs del servidor.")
     return {
         "reply": _text(out["messages"][-1].content),
         "progress": progress(out),
@@ -67,7 +82,14 @@ def chat(body: ChatIn, request: Request):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    """Chequeo de estado: no expone secretos, solo si están configurados."""
+    return {
+        "status": "ok",
+        "model": MODEL,
+        "api_key_set": bool(os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")),
+        "checkpointer": "postgres" if os.getenv("DATABASE_URL") else "memory",
+        "n8n_webhook_set": bool(os.getenv("N8N_WEBHOOK_URL")),
+    }
 
 
 STATIC = Path(__file__).parent / "static"
