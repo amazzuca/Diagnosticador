@@ -1,291 +1,373 @@
-"""Grafo LangGraph del bot diagnosticador de automatización.
+"""Grafo LangGraph del relevador de procesos.
 
-Flujo por cada mensaje del usuario:
+Cada mensaje del usuario recorre:
 
-    START ─► (¿ya terminó?) ─► after ─► END
-                  │
-                  └► extract ─► (¿faltan datos?) ─► ask ──► END
-                                      │
-                                      └► report ─► END   (genera diagnóstico + webhook n8n)
+    START ─► sanitize ─► (gate) ─► interview ─► END      conversación normal
+                            ├────► after     ─► END      relevamiento ya terminado
+                            └────► capped    ─► END      límite de turnos de la sesión
 
-Webhook a n8n (campo "evento"):
-  - "contacto_capturado": apenas el usuario deja mail o teléfono (no se pierde el lead si abandona)
-  - "diagnostico": al terminar la entrevista, con el informe completo
-El estado se persiste por thread_id con un checkpointer (memoria o Postgres).
+- sanitize : limpia el mensaje (bloques ocultos falsificados), captura mail/teléfono por regex.
+- interview: 1 llamada al LLM con tu prompt + estado JSON; separa texto visible, botones [[...]]
+             y el bloque oculto <estado>; aplica el blindaje de salida.
+- Cuando la fase pasa a "cierre"/"terminado", el endpoint lanza en segundo plano `run_informe`,
+  que genera <informe_consultor> + <mejoras_propuestas> y los envía a n8n / Postgres.
 """
+import hashlib
 import json
 import logging
 import os
 import re
-from typing import Annotated, Literal, Optional, TypedDict
+from typing import Annotated, Literal, TypedDict
 
 import httpx
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from pydantic import BaseModel, Field, create_model
+
+from . import store
+from .prompt import AGENCY, build_system
 
 logger = logging.getLogger("diagnosticador")
 
 MODEL = os.getenv("MODEL", "openai:gpt-4o-mini")
-MAX_TURNS = int(os.getenv("MAX_TURNS", "20"))
+MAX_TURNS = int(os.getenv("MAX_TURNS", "60"))  # mensajes del usuario por conversación
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
 N8N_WEBHOOK_TOKEN = os.getenv("N8N_WEBHOOK_TOKEN", "")
-AGENCY_NAME = os.getenv("AGENCY_NAME", "nuestra agencia")
+HISTORY_WINDOW = 16  # mensajes que ve el modelo; el resto vive en <estado>
+MAX_INFORMES = 5  # informes por conversación (control de costo)
 
-llm = init_chat_model(MODEL, temperature=0.3, timeout=60, max_retries=3)
+llm = init_chat_model(MODEL, temperature=0.3, timeout=120, max_retries=2, max_tokens=6000)
 
 # ---------------------------------------------------------------------------
-# Campos que el bot necesita relevar (orden = prioridad de preguntas).
-# El contacto va 3º a propósito: si el usuario abandona, el lead ya está capturado.
+# Fases (progreso y etiqueta que ve el usuario en el encabezado)
 # ---------------------------------------------------------------------------
-FIELDS = [
-    ("empresa", "Nombre de la empresa, rubro y tamaño (cantidad de empleados)"),
-    ("proceso", "Qué proceso quiere automatizar y cuál es el objetivo"),
-    ("contacto", "Nombre y cargo de la persona de contacto, junto con su mail y su teléfono/WhatsApp"),
-    ("pasos", "Pasos actuales del proceso, de principio a fin, y quién hace cada uno"),
-    ("disparador_frecuencia", "Qué dispara el proceso y con qué frecuencia/volumen (por día, semana o mes)"),
-    ("tiempo_costo", "Tiempo que toma cada ejecución, cuántas personas intervienen y costo aproximado"),
-    ("sistemas", "Sistemas y herramientas involucrados (ERP, Excel, mail, WhatsApp, CRM, etc.)"),
-    ("datos_entrada", "Tipo y formato de los datos de entrada (planillas, PDFs, mails, formularios, imágenes) y su calidad"),
-    ("reglas_excepciones", "Reglas de decisión, aprobaciones y excepciones frecuentes"),
-    ("dolor", "Principales problemas hoy: errores, demoras, retrabajo, impacto en el negocio"),
-    ("accesos_apis", "Si los sistemas tienen API, exportaciones o acceso a base de datos; quién administra los accesos"),
-    ("datos_sensibles", "Datos sensibles o requisitos de seguridad/cumplimiento"),
-    ("exito_plazo", "Cómo medirían el éxito (KPI), plazo y presupuesto estimado"),
-]
-TOTAL = len(FIELDS)
-
-Extraction = create_model(
-    "Extraction",
-    quiere_cerrar=(
-        bool,
-        Field(default=False, description="True solo si el usuario pide explícitamente terminar o recibir ya el diagnóstico"),
-    ),
-    email=(Optional[str], Field(default=None, description="Email de contacto, copiado tal como lo escribió el usuario")),
-    telefono=(Optional[str], Field(default=None, description="Teléfono o WhatsApp de contacto, copiado tal como lo escribió el usuario")),
-    **{k: (Optional[str], Field(default=None, description=d)) for k, d in FIELDS},
-)
+PHASES = {
+    "identificacion": (10, "Identificación"),
+    "eleccion_modo": (20, "Elección de modo"),
+    "deep_d1": (30, "Mapa del área"),
+    "deep_d2": (40, "Método"),
+    "deep_d3": (60, "Detalle por etapa"),
+    "rapido_r1": (30, "Objetivo"),
+    "rapido_r2": (40, "Método"),
+    "rapido_r3": (60, "Detalle del proceso"),
+    "validacion": (90, "Validación"),
+    "cierre": (100, "Relevamiento completo"),
+    "terminado": (100, "Finalizado"),
+}
 
 
-class Diagnostico(BaseModel):
-    resumen_cliente: str = Field(description="Diagnóstico preliminar en markdown para mostrar al cliente (sin precios)")
-    informe_interno: str = Field(description="Informe interno en markdown para la agencia")
-    score_viabilidad: int = Field(ge=1, le=10, description="Viabilidad global de automatizar (1-10)")
-    complejidad: Literal["baja", "media", "alta"]
-    herramienta_recomendada: Literal["n8n", "Power Automate", "Zapier", "Python a medida", "Combinada"]
-    ahorro_horas_mes: Optional[float] = Field(default=None, description="Horas/mes ahorradas, solo si se puede calcular con los datos dados")
-    calidad_lead: Literal["alta", "media", "baja"]
+def phase_info(estado: dict | None) -> tuple[int, str]:
+    fase = (estado or {}).get("fase")
+    return PHASES.get(fase, (0, "Iniciando"))
+
+
+def estado_inicial() -> dict:
+    return {
+        "fase": "identificacion",
+        "modo": None,
+        "persona": {"nombre": "", "area": "", "rol": "", "herramientas": []},
+        "proceso_actual": "",
+        "procesos_mencionados": [],
+        "etapas": [],
+        "documentos_analizados": [],
+        "oportunidades_adicionales": [],
+        "huecos": [],
+        "senales_comerciales": [],
+    }
 
 
 # ---------------------------------------------------------------------------
-# Prompts
+# Utilidades de parseo
 # ---------------------------------------------------------------------------
-EXTRACT_SYSTEM = """Sos un analista que extrae información de una entrevista de diagnóstico de automatización.
-Leé la conversación y completá SOLO los campos sobre los que el usuario aportó información.
-
-Reglas:
-- No inventes ni infieras datos que el usuario no dijo.
-- email y telefono: copialos exactamente como los escribió el usuario. Si no los dio, null.
-- Si un campo ya tiene valor y el usuario agrega detalle, devolvé el valor combinado y actualizado.
-- Si el usuario dice que no sabe o prefiere no responder sobre algo que se le preguntó, poné "No informado" en ese campo.
-- Dejá en null lo que no se mencionó.
-
-Datos ya relevados:
-{data}"""
-
-ASK_SYSTEM = """Sos el asistente de diagnóstico de {agency}, una consultora de automatización de procesos para pymes.
-Conducís una entrevista breve para entender un proceso que la empresa quiere automatizar.
-
-Estilo: español rioplatense, cálido, profesional y conciso.
-
-Reglas:
-- Hacé UNA pregunta por turno (máximo dos si están estrechamente relacionadas).
-- Si el usuario aportó información, reconocelo en una frase corta antes de preguntar.
-- Si es el primer mensaje, presentate en una línea, aclará que son unos 10 minutos de preguntas y empezá.
-- Si la respuesta anterior fue vaga, pedí un ejemplo concreto o un número aproximado.
-- Aceptá "no sé" como respuesta válida y seguí adelante.
-- Si el tema es el contacto, explicá en una frase que es para enviarle el diagnóstico y que un consultor lo contacte; pedí nombre, mail y WhatsApp o teléfono.
-- NO des recomendaciones ni soluciones todavía. NO menciones campos internos ni listas.
-
-Tema a cubrir ahora: {next_topic}
-Datos ya relevados: {data}
-Progreso: {filled}/{total}"""
-
-REPORT_SYSTEM = f"""Sos un consultor senior de automatización de {AGENCY_NAME}. Con los datos de la entrevista, generá un diagnóstico.
-
-Criterios para recomendar herramienta:
-- n8n: flujos complejos, APIs, self-hosting, integración de bases de datos, bajo costo por ejecución.
-- Power Automate: el cliente vive en Microsoft 365 / SharePoint / Dataverse / Teams.
-- Zapier: integraciones simples SaaS a SaaS, bajo volumen, el cliente quiere autonomía.
-- Python a medida: scraping, ML/visión por computadora, procesamiento pesado de datos, lógica muy específica.
-- Combinada: cuando ninguna sola cubre el caso. Sumá un LLM cuando haya documentos o texto no estructurado.
-
-Reglas:
-- No inventes cifras. Si estimás ahorro, calculalo SOLO con frecuencia × tiempo informados y explicitá los supuestos. Si no alcanza, ahorro_horas_mes = null.
-- Si faltan datos críticos, decilo y listalo como "a validar".
-- resumen_cliente (máx. ~350 palabras, markdown): qué entendimos del proceso, viabilidad, enfoque recomendado en lenguaje simple, beneficios esperados, prerrequisitos o riesgos, próximos pasos. Sin precios ni jerga innecesaria.
-- informe_interno (markdown): resumen del lead, proceso AS-IS, arquitectura propuesta, stack, complejidad y por qué, riesgos, dudas pendientes, oportunidades de ampliar el alcance, esquema sugerido de propuesta comercial.
-- calidad_lead: considerá presupuesto/plazo, dolor real, volumen y decisor de contacto."""
-
-
-# ---------------------------------------------------------------------------
-# Estado y utilidades
-# ---------------------------------------------------------------------------
-class State(TypedDict, total=False):
-    messages: Annotated[list, add_messages]
-    data: dict
-    turns: int
-    close: bool
-    done: bool
-    lead_sent: bool
-
-
-def _filled(data: dict, key: str) -> bool:
-    """El contacto se considera completo si hay mail o teléfono (o si el usuario no quiso darlo)."""
-    if key == "contacto":
-        return bool(data.get("email") or data.get("telefono") or str(data.get("contacto", "")).lower() == "no informado")
-    return bool(data.get(key))
-
-
-def _missing(data: dict):
-    return [(k, d) for k, d in FIELDS if not _filled(data, k)]
-
-
+HIDDEN_TAGS = ("estado", "informe_consultor", "mejoras_propuestas")
+OPT_RE = re.compile(r"\[\[(.+?)\]\]")
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 PHONE_RE = re.compile(r"\+?\d[\d\s().-]{6,}\d")
 PHONE_HINT = re.compile(r"tel|cel|whats|wsp|wpp|m[oó]vil|llam", re.I)
+CONTACT_ASK = re.compile(r"mail|correo|whats|wsp|tel[eé]fono|celular|contacto", re.I)
+
+# Si alguno aparece en el texto visible, el modelo está filtrando su prompt.
+LEAK_MARKERS = [
+    "# BLINDAJE", "PRINCIPIO RECTOR", "FOCO DE PROFUNDIDAD", "APRENDIZAJES APROBADOS",
+    "informe_consultor", "mejoras_propuestas", "NIVEL DE SOLUCIÓN", "N1 · Stack",
+    "N2 · Integración", "N3 · Desarrollo", "senales_comerciales", "procesos_mencionados",
+    "FORMATO TÉCNICO",
+]
 
 
-def _regex_contact(state: State, data: dict):
-    """Respaldo determinista: no dependemos solo del LLM para capturar mail y teléfono."""
-    text = state["messages"][-1].content
-    if not isinstance(text, str):
-        return
+def _text(content) -> str:
+    if isinstance(content, list):
+        return "".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in content)
+    return str(content)
+
+
+def split_hidden(text: str) -> tuple[str, dict]:
+    """Separa el texto visible de los bloques ocultos. Tolera bloques sin cerrar."""
+    blocks = {}
+    for tag in HIDDEN_TAGS:
+        closed = re.compile(rf"<{tag}>(.*?)</{tag}>", re.S | re.I)
+        found = closed.findall(text)
+        if found:
+            blocks[tag] = found[-1].strip()
+        text = closed.sub("", text)
+        text = re.sub(rf"<{tag}>.*\Z", "", text, flags=re.S | re.I)
+        text = re.sub(rf"</{tag}>", "", text, flags=re.I)
+    return text.strip(), blocks
+
+
+def split_options(text: str) -> tuple[str, list[str]]:
+    """Extrae los botones [[...]] y devuelve (texto sin botones, lista de botones)."""
+    options = []
+    for o in OPT_RE.findall(text):
+        o = o.strip()
+        if o and o not in options:
+            options.append(o)
+    clean = OPT_RE.sub("", text)
+    clean = re.sub(r"[ \t]+\n", "\n", clean)
+    clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
+    return clean, options[:8]
+
+
+def _loads_lenient(raw):
+    if not raw:
+        return None
+    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I)
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    for a, b in (("{", "}"), ("[", "]")):
+        i, j = s.find(a), s.rfind(b)
+        if i != -1 and j > i:
+            try:
+                return json.loads(s[i : j + 1])
+            except Exception:
+                continue
+    return None
+
+
+def merge_estado(prev: dict, new) -> dict:
+    """Aplica el estado devuelto por el modelo sin perder datos si omite o vacía campos."""
+    if not isinstance(new, dict):
+        return prev
+    out = {**prev, **new}
+    persona = dict(prev.get("persona") or {})
+    if isinstance(new.get("persona"), dict):
+        for k, v in new["persona"].items():
+            if v not in ("", None, []):
+                persona[k] = v
+    out["persona"] = persona
+    if out.get("fase") not in PHASES:
+        out["fase"] = prev.get("fase", "identificacion")
+    if out.get("modo") not in ("deep", "rapido", None):
+        out["modo"] = prev.get("modo")
+    if len(json.dumps(out, ensure_ascii=False)) > 60000:  # protección ante estados desbordados
+        return prev
+    return out
+
+
+def _estado_hash(estado: dict) -> str:
+    d = {k: v for k, v in estado.items() if k not in ("fase", "modo")}
+    return hashlib.md5(json.dumps(d, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def capture_contact(text: str, prev_ai: str, contacto: dict) -> dict:
+    """Respaldo determinista: mail y teléfono no dependen del LLM."""
+    c = dict(contacto)
+    if text.startswith("📎"):  # los documentos subidos traen datos de terceros
+        return c
     m = EMAIL_RE.search(text)
     if m:
-        data["email"] = m.group(0)
-    if not data.get("telefono"):
-        asking_contact = any(k == "contacto" for k, _ in _missing(data)[:2])
+        c["email"] = m.group(0)
+    if not c.get("telefono"):
+        asking = bool(CONTACT_ASK.search(prev_ai))
         for m in PHONE_RE.finditer(text):
             raw = m.group(0).strip()
             digits = re.sub(r"\D", "", raw)
-            if 8 <= len(digits) <= 15 and (asking_contact or raw.startswith("+") or PHONE_HINT.search(text)):
-                data["telefono"] = raw
+            if 8 <= len(digits) <= 15 and (asking or raw.startswith("+") or PHONE_HINT.search(text)):
+                c["telefono"] = raw
                 break
+    return c
 
 
+def _window(messages: list) -> list:
+    w = list(messages[-HISTORY_WINDOW:])
+    while w and not isinstance(w[0], HumanMessage):  # Anthropic exige empezar con usuario
+        w.pop(0)
+    return w or list(messages[-1:])
+
+
+def _transcript(messages: list, cap: int = 40000) -> str:
+    lines = []
+    for m in messages:
+        who = "USUARIO" if isinstance(m, HumanMessage) else "BOT"
+        t = _text(m.content)
+        if len(t) > 3000:
+            t = t[:3000] + " …[recortado]"
+        lines.append(f"{who}: {t}")
+    s = "\n".join(lines)
+    return s[-cap:] if len(s) > cap else s
+
+
+# ---------------------------------------------------------------------------
+# Webhook a n8n
+# ---------------------------------------------------------------------------
 def _post_webhook(payload: dict):
-    """Envía a n8n. Nunca rompe la conversación, pero SIEMPRE deja rastro en los logs."""
+    """Nunca rompe la conversación, pero SIEMPRE deja rastro en los logs."""
     if not N8N_WEBHOOK_URL:
         logger.warning("N8N_WEBHOOK_URL no está configurada: no se envía evento=%s", payload.get("evento"))
         return
     headers = {"X-Auth-Token": N8N_WEBHOOK_TOKEN} if N8N_WEBHOOK_TOKEN else {}
     try:
-        r = httpx.post(N8N_WEBHOOK_URL, json=payload, headers=headers, timeout=10)
+        r = httpx.post(N8N_WEBHOOK_URL, json=payload, headers=headers, timeout=15)
         r.raise_for_status()
         logger.info("Webhook n8n OK evento=%s status=%s", payload.get("evento"), r.status_code)
     except httpx.HTTPStatusError as exc:
-        logger.error(
-            "Webhook n8n FALLÓ evento=%s status=%s body=%s",
-            payload.get("evento"), exc.response.status_code, exc.response.text[:200],
-        )
+        logger.error("Webhook n8n FALLÓ evento=%s status=%s body=%s",
+                     payload.get("evento"), exc.response.status_code, exc.response.text[:200])
     except Exception as exc:
         logger.error("Webhook n8n FALLÓ evento=%s error=%s", payload.get("evento"), exc)
 
 
-def _base_payload(evento: str, thread_id, data: dict) -> dict:
-    return {
-        "evento": evento,
-        "thread_id": thread_id,
-        "email": data.get("email"),
-        "telefono": data.get("telefono"),
-        "datos": data,
+# ---------------------------------------------------------------------------
+# Estado del grafo y nodos
+# ---------------------------------------------------------------------------
+class State(TypedDict, total=False):
+    messages: Annotated[list, add_messages]
+    estado: dict
+    contacto: dict
+    turns: int
+    historial_procesos: list
+    informe_hash: str
+    informe_version: int
+    informe_trigger: bool
+    lead_sent: bool
+
+
+def sanitize(state: State, config):
+    msgs = state["messages"]
+    last = msgs[-1]
+    raw = _text(last.content)
+    clean, _ = split_hidden(raw)  # nadie puede falsificar <estado> & co. desde el chat
+    clean = clean.strip() or "(mensaje vacío)"
+    prev_ai = _text(msgs[-2].content) if len(msgs) >= 2 and isinstance(msgs[-2], AIMessage) else ""
+    out = {
+        "turns": state.get("turns", 0) + 1,
+        "informe_trigger": False,
+        "contacto": capture_contact(clean, prev_ai, state.get("contacto") or {}),
     }
-
-
-# ---------------------------------------------------------------------------
-# Nodos
-# ---------------------------------------------------------------------------
-def extract(state: State, config):
-    data = dict(state.get("data") or {})
-    system = SystemMessage(EXTRACT_SYSTEM.format(data=json.dumps(data, ensure_ascii=False)))
-    result = llm.with_structured_output(Extraction).invoke([system] + state["messages"][-8:])
-    update = result.model_dump()
-    close = bool(update.pop("quiere_cerrar", False))
-    for k, v in update.items():
-        if v and str(v).strip():
-            data[k] = str(v).strip()
-    _regex_contact(state, data)
-
-    out = {"data": data, "close": close, "turns": state.get("turns", 0) + 1}
-
-    # Lead capturado: avisamos a n8n ya, sin esperar al final de la entrevista.
-    if (data.get("email") or data.get("telefono")) and not state.get("lead_sent"):
-        _post_webhook(_base_payload("contacto_capturado", config["configurable"].get("thread_id"), data))
-        out["lead_sent"] = True
+    if clean != raw:
+        out["messages"] = [HumanMessage(content=clean, id=last.id)]
     return out
 
 
-def route_after_extract(state: State) -> Literal["ask", "report"]:
-    if state.get("close") or not _missing(state.get("data", {})) or state.get("turns", 0) >= MAX_TURNS:
-        return "report"
-    return "ask"
+def gate(state: State) -> Literal["after", "capped", "interview"]:
+    if (state.get("estado") or {}).get("fase") == "terminado":
+        return "after"
+    if state.get("turns", 0) > MAX_TURNS + 3:
+        return "capped"
+    return "interview"
 
 
-def ask(state: State):
-    data = state.get("data", {})
-    missing = _missing(data)
-    next_topic = " / ".join(d for _, d in missing[:2])
-    system = SystemMessage(
-        ASK_SYSTEM.format(
-            agency=AGENCY_NAME,
-            next_topic=next_topic,
-            data=json.dumps(data, ensure_ascii=False),
-            filled=TOTAL - len(missing),
-            total=TOTAL,
+def _trigger(state: State, estado: dict, force: bool = False) -> dict:
+    """¿Hay que (re)generar el informe del consultor? Solo si cambió el contenido relevado."""
+    version = state.get("informe_version", 0)
+    h = _estado_hash(estado)
+    if (force or estado.get("fase") in ("cierre", "terminado")) and h != state.get("informe_hash") and version < MAX_INFORMES:
+        return {"informe_trigger": True, "informe_hash": h, "informe_version": version + 1}
+    return {"informe_trigger": False}
+
+
+def interview(state: State, config):
+    thread_id = config["configurable"].get("thread_id")
+    prev = state.get("estado") or estado_inicial()
+    historial = state.get("historial_procesos") or []
+    turns = state.get("turns", 1)
+
+    system = build_system(store.approved_learnings())
+    system += "\n\n# ESTADO ACTUAL (guardado por el sistema; actualizalo y devolvelo en <estado>)\n"
+    system += json.dumps(prev, ensure_ascii=False)
+    if historial:
+        system += "\n\n# PROCESOS YA RELEVADOS EN ESTA SESIÓN (solo nombres)\n"
+        system += ", ".join(h.get("proceso", "?") for h in historial)
+    if turns >= MAX_TURNS:
+        system += (
+            "\n\n# AVISO DEL SISTEMA\nSe alcanzó el límite de la sesión: cerrá ahora el relevamiento con lo "
+            "relevado (SALIDA PARA EL USUARIO), poné fase = \"cierre\" y anotá en huecos lo que quedó incompleto."
         )
-    )
-    reply = llm.invoke([system] + state["messages"][-8:])
-    return {"messages": [reply]}
 
+    raw = llm.invoke([SystemMessage(content=system)] + _window(state["messages"]))
+    visible, blocks = split_hidden(_text(raw.content))
 
-def report(state: State, config):
-    data = state.get("data", {})
-    system = SystemMessage(REPORT_SYSTEM)
-    brief = SystemMessage("Datos relevados en la entrevista:\n" + json.dumps(data, ensure_ascii=False, indent=2))
-    diag: Diagnostico = llm.with_structured_output(Diagnostico).invoke([system, brief])
-
-    text = diag.resumen_cliente
-    if data.get("email") or data.get("telefono"):
-        text += f"\n\n---\nUn consultor de {AGENCY_NAME} te va a contactar para coordinar los próximos pasos. ¡Gracias por tu tiempo!"
+    # Blindaje de salida: si el modelo filtra su prompt, se reemplaza y se descarta su estado.
+    leaked = any(m.lower() in visible.lower() for m in LEAK_MARKERS)
+    if leaked:
+        logger.warning("Posible filtración de prompt en thread=%s: respuesta reemplazada", thread_id)
+        visible = f"Soy un asistente de relevamiento de {AGENCY}. Sigamos con tu proceso. [[Volver al relevamiento]]"
+        estado = prev
     else:
-        text += f"\n\n---\nSi querés avanzar, escribinos y coordinamos una reunión con {AGENCY_NAME}. ¡Gracias por tu tiempo!"
+        estado = merge_estado(prev, _loads_lenient(blocks.get("estado")))
+        if "estado" in blocks and estado is prev:
+            logger.warning("Estado inválido del modelo en thread=%s: se conserva el anterior", thread_id)
+    if not visible.strip():
+        visible = "Perdón, no pude procesar eso. ¿Podés repetirlo?"
 
-    payload = _base_payload("diagnostico", config["configurable"].get("thread_id"), data)
-    payload.update(diag.model_dump())
-    _post_webhook(payload)
-    return {"messages": [AIMessage(content=text)], "done": True}
+    # Si arranca otro proceso, se resguarda el mapa del anterior (el estado solo guarda uno a la vez)
+    a = (prev.get("proceso_actual") or "").strip()
+    b = (estado.get("proceso_actual") or "").strip()
+    if a and b and a.lower() != b.lower() and prev.get("etapas") and not any(
+        h.get("proceso", "").lower() == a.lower() for h in historial
+    ):
+        historial = historial + [{"proceso": a, "etapas": prev["etapas"]}]
+
+    contacto = state.get("contacto") or {}
+    lead_sent = state.get("lead_sent", False)
+    if (contacto.get("email") or contacto.get("telefono")) and not lead_sent:
+        _post_webhook({
+            "evento": "contacto_capturado", "thread_id": thread_id,
+            "email": contacto.get("email"), "telefono": contacto.get("telefono"),
+            "persona": estado.get("persona"), "estado": estado,
+        })
+        lead_sent = True
+
+    store.save_relevamiento(thread_id, estado, contacto)
+    return {
+        "messages": [AIMessage(content=visible)],
+        "estado": estado,
+        "historial_procesos": historial,
+        "lead_sent": lead_sent,
+        **_trigger(state, estado),
+    }
 
 
 def after(state: State):
-    msg = "El diagnóstico ya fue generado. Si querés analizar otro proceso, recargá la página para empezar una nueva entrevista."
+    msg = (f"El relevamiento ya fue enviado al equipo de {AGENCY}. "
+           "Si querés relevar otro proceso, recargá la página para empezar de nuevo.")
     return {"messages": [AIMessage(content=msg)]}
 
 
-def gate(state: State) -> Literal["after", "extract"]:
-    return "after" if state.get("done") else "extract"
+def capped(state: State):
+    estado = state.get("estado") or estado_inicial()
+    msg = (f"Llegamos al límite de esta sesión. Lo relevado ya quedó registrado para que un consultor de "
+           f"{AGENCY} lo revise. Si querés seguir, recargá la página para empezar una nueva.")
+    return {"messages": [AIMessage(content=msg)], **_trigger(state, estado, force=True)}
 
 
-def progress(state: dict) -> float:
-    data = state.get("data") or {}
-    return round(sum(1 for k, _ in FIELDS if _filled(data, k)) / TOTAL, 2)
+def build_graph():
+    g = StateGraph(State)
+    g.add_node("sanitize", sanitize)
+    g.add_node("interview", interview)
+    g.add_node("after", after)
+    g.add_node("capped", capped)
+    g.add_edge(START, "sanitize")
+    g.add_conditional_edges("sanitize", gate)
+    g.add_edge("interview", END)
+    g.add_edge("after", END)
+    g.add_edge("capped", END)
+    return g.compile(checkpointer=make_checkpointer())
 
 
-# ---------------------------------------------------------------------------
-# Construcción
-# ---------------------------------------------------------------------------
 def make_checkpointer():
     url = os.getenv("DATABASE_URL")
     if url:
@@ -307,15 +389,79 @@ def make_checkpointer():
     return MemorySaver()
 
 
-def build_graph():
-    g = StateGraph(State)
-    g.add_node("extract", extract)
-    g.add_node("ask", ask)
-    g.add_node("report", report)
-    g.add_node("after", after)
-    g.add_conditional_edges(START, gate)
-    g.add_conditional_edges("extract", route_after_extract)
-    g.add_edge("ask", END)
-    g.add_edge("report", END)
-    g.add_edge("after", END)
-    return g.compile(checkpointer=make_checkpointer())
+# ---------------------------------------------------------------------------
+# Informe del consultor + automejora (segundo plano, tras el cierre)
+# ---------------------------------------------------------------------------
+INFORME_TASK = """# TAREA ACTUAL (del sistema)
+El relevamiento llegó a su cierre. Generá ahora ÚNICAMENTE estos dos bloques, sin ningún texto adicional:
+<informe_consultor> ...las 12 secciones de "SALIDA PARA EL CONSULTOR", en markdown... </informe_consultor>
+<mejoras_propuestas> ...array JSON con el formato de AUTOMEJORA (máximo 5, solo con evidencia concreta)... </mejoras_propuestas>
+Reglas: usá el ESTADO FINAL y la TRANSCRIPCIÓN como única fuente; incluí también los PROCESOS RELEVADOS ANTES si los hay; marcá cada proceso como "núcleo" o "soporte"; si el relevamiento se cortó antes de tiempo, marcá en huecos qué quedó incompleto; las evidencias son frases textuales del usuario."""
+
+MEJORA_TIPOS = {"pregunta_nueva", "senal_nueva", "perfil_area", "rubro", "ajuste_flujo", "stack"}
+
+
+def parse_mejoras(raw) -> list[dict]:
+    data = _loads_lenient(raw)
+    if isinstance(data, dict):
+        data = [data]
+    out = []
+    for m in data if isinstance(data, list) else []:
+        if not isinstance(m, dict) or m.get("tipo") not in MEJORA_TIPOS:
+            continue
+        prop, evid = str(m.get("propuesta") or "").strip(), str(m.get("evidencia") or "").strip()
+        if not prop or not evid:  # sin evidencia concreta no se guarda
+            continue
+        out.append({
+            "tipo": m["tipo"], "propuesta": prop[:600], "evidencia": evid[:400],
+            "motivo": str(m.get("motivo") or "")[:400], "donde_aplica": str(m.get("donde_aplica") or "")[:120],
+        })
+    return out[:5]
+
+
+def generate_informe(estado: dict, historial: list, transcript: str) -> tuple[str, list[dict]]:
+    system = build_system(store.approved_learnings(), technical=False) + "\n\n" + INFORME_TASK
+    user = (
+        "ESTADO FINAL (JSON):\n" + json.dumps(estado, ensure_ascii=False)
+        + "\n\nPROCESOS RELEVADOS ANTES (JSON):\n" + json.dumps(historial, ensure_ascii=False)
+        + "\n\nTRANSCRIPCIÓN:\n" + transcript
+    )
+    raw = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+    text = _text(raw.content)
+    m = re.search(r"<informe_consultor>(.*?)</informe_consultor>", text, re.S | re.I)
+    informe = (m.group(1).strip() if m else re.sub(r"<mejoras_propuestas>.*", "", text, flags=re.S | re.I).strip())
+    if len(informe) < 100:
+        raise ValueError("El modelo no devolvió un informe utilizable")
+    mj = re.search(r"<mejoras_propuestas>(.*?)</mejoras_propuestas>", text, re.S | re.I)
+    return informe, parse_mejoras(mj.group(1) if mj else "")
+
+
+def run_informe(graph, thread_id: str):
+    """Tarea en segundo plano: el usuario ya recibió su respuesta; esto no lo hace esperar."""
+    config = {"configurable": {"thread_id": thread_id}}
+    snap = {}
+    try:
+        snap = graph.get_state(config).values
+        estado = snap.get("estado") or {}
+        contacto = snap.get("contacto") or {}
+        version = snap.get("informe_version", 1)
+        informe, mejoras = generate_informe(
+            estado, snap.get("historial_procesos") or [], _transcript(snap.get("messages") or [])
+        )
+    except Exception:
+        logger.exception("No se pudo generar el informe thread=%s", thread_id)
+        _post_webhook({
+            "evento": "informe_fallido", "thread_id": thread_id,
+            "email": (snap.get("contacto") or {}).get("email"),
+            "telefono": (snap.get("contacto") or {}).get("telefono"),
+            "estado": snap.get("estado"), "historial_procesos": snap.get("historial_procesos"),
+        })
+        return
+    _post_webhook({
+        "evento": "informe_consultor", "thread_id": thread_id, "version": version,
+        "email": contacto.get("email"), "telefono": contacto.get("telefono"),
+        "persona": estado.get("persona"), "estado": estado,
+        "informe_consultor": informe, "mejoras_propuestas": mejoras,
+    })
+    store.save_relevamiento(thread_id, estado, contacto, informe=informe, version=version)
+    store.save_mejoras(thread_id, mejoras)

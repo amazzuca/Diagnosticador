@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>__AGENCY__ · Diagnóstico de automatización</title>
+<title>__AGENCY__ · Relevamiento de procesos</title>
 <script>
   // Aplica el tema guardado antes de pintar (evita el destello)
   try { document.documentElement.setAttribute("data-theme", localStorage.getItem("bot-theme") || "light"); } catch (_) {}
@@ -18,7 +18,6 @@
   --text:#111827;--text2:#4b5563;--text3:#9ca3af;
   --red:#dc2626;--amber:#d97706;--green:#16a34a;--blue:#2563eb;
   --sh:0 1px 3px rgba(0,0,0,.07),0 2px 8px rgba(0,0,0,.05);
-  --sh2:0 4px 20px rgba(0,0,0,.1);
 }
 [data-theme=dark]{
   --bg:#0f1117;--surface:#1a1f2e;--surface2:#222840;
@@ -26,11 +25,11 @@
   --accent:#6366f1;--accent2:#818cf8;--accent-light:#1e1b4b;
   --text:#f1f5f9;--text2:#94a3b8;--text3:#475569;
   --red:#f87171;--amber:#fbbf24;--green:#4ade80;--blue:#60a5fa;
-  --sh:0 2px 8px rgba(0,0,0,.4);--sh2:0 8px 32px rgba(0,0,0,.4);
+  --sh:0 2px 8px rgba(0,0,0,.4);
 }
 body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);height:100dvh;font-size:14px;line-height:1.5;display:flex;flex-direction:column}
 
-/* ── ENCABEZADO (mismo formato que ProPulse) ── */
+/* ── ENCABEZADO (formato ProPulse) ── */
 .topbar{background:var(--surface);border-bottom:1px solid var(--border);height:54px;padding:0 20px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:40;flex-shrink:0}
 .topbar-logo{font-size:18px;font-weight:700;letter-spacing:-.5px;color:var(--text)}
 .topbar-logo span{color:var(--accent)}
@@ -41,6 +40,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--t
 .sync.err{background:rgba(220,38,38,.1);color:var(--red);border:1px solid rgba(220,38,38,.2)}
 .icon-btn{height:34px;border-radius:20px;border:1px solid var(--border);background:var(--surface2);cursor:pointer;display:flex;align-items:center;justify-content:center;gap:5px;font-size:13px;font-weight:500;font-family:inherit;color:var(--text2);padding:0 12px;transition:all .15s;white-space:nowrap}
 .icon-btn:hover{border-color:var(--border2)}
+.icon-btn:disabled{opacity:.5;cursor:not-allowed}
 .nav{background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 16px;overflow-x:auto;flex-shrink:0}
 .nav::-webkit-scrollbar{display:none}
 .nav-btn{padding:14px 16px;font-size:13px;font-weight:500;border:none;background:none;cursor:default;color:var(--text3);border-bottom:2px solid transparent;white-space:nowrap;font-family:inherit;display:flex;align-items:center;gap:5px}
@@ -62,7 +62,10 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--t
 .typing{color:var(--text3);font-style:italic}
 .err small{display:block;margin-top:6px;color:var(--text3)}
 .msg .btn{margin-top:8px}
-form{display:flex;gap:8px;padding:12px 14px;border-top:1px solid var(--border);background:var(--surface)}
+.opts{display:flex;flex-wrap:wrap;gap:8px;align-self:flex-start;max-width:90%}
+.btn.opt{border-radius:20px;border-color:var(--accent);color:var(--accent);background:var(--surface)}
+.btn.opt:hover{background:var(--accent-light)}
+form{display:flex;gap:8px;padding:12px 14px;border-top:1px solid var(--border);background:var(--surface);align-items:flex-end}
 textarea{flex:1;resize:none;padding:9px 12px;border:1px solid var(--border);border-radius:8px;font-size:13px;background:var(--surface2);color:var(--text);font-family:inherit;max-height:120px;transition:border .15s}
 textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.1)}
 textarea::placeholder{color:var(--text3)}
@@ -71,6 +74,7 @@ textarea::placeholder{color:var(--text3)}
 .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
 .btn.primary:hover{background:var(--accent2);border-color:var(--accent2);color:#fff}
 .btn:disabled,textarea:disabled{opacity:.5;cursor:not-allowed}
+#file{display:none}
 
 @media (max-width:520px){
   .topbar{padding:0 12px}
@@ -89,7 +93,7 @@ textarea::placeholder{color:var(--text3)}
     </div>
   </div>
   <div class="nav">
-    <button class="nav-btn on" type="button" tabindex="-1">🤖 Diagnóstico de automatización</button>
+    <button class="nav-btn on" type="button" tabindex="-1">🤖 Relevamiento de procesos</button>
     <span class="nav-right" id="label">Iniciando…</span>
   </div>
   <div class="pbar"><div id="bar"></div></div>
@@ -98,6 +102,8 @@ textarea::placeholder{color:var(--text3)}
     <div class="card">
       <div id="chat"></div>
       <form id="form">
+        <input type="file" id="file" accept=".pdf,.docx,.xlsx,.csv,.txt,.md">
+        <button class="icon-btn" type="button" id="attach" title="Subir un documento (PDF, Word, Excel, CSV o TXT · máx. 5 MB)" disabled>📎</button>
         <textarea id="input" rows="1" placeholder="Escribí tu respuesta…" disabled></textarea>
         <button class="btn primary" id="btn" disabled>Enviar</button>
       </form>
@@ -115,12 +121,15 @@ textarea::placeholder{color:var(--text3)}
   const form = document.getElementById("form");
   const input = document.getElementById("input");
   const btn = document.getElementById("btn");
+  const attach = document.getElementById("attach");
+  const fileInput = document.getElementById("file");
   const bar = document.getElementById("bar");
   const label = document.getElementById("label");
   const syncEl = document.getElementById("sync");
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  let optionsEl = null;
 
-  // ── Tema claro/oscuro (como ProPulse) ──
+  // ── Tema claro/oscuro ──
   function applyTheme(t) {
     document.documentElement.setAttribute("data-theme", t);
     document.getElementById("theme-icon").textContent = t === "dark" ? "☀️" : "🌙";
@@ -133,11 +142,7 @@ textarea::placeholder{color:var(--text3)}
   }
   applyTheme(document.documentElement.getAttribute("data-theme") || "light");
 
-  // ── Indicador de estado (pill verde / ámbar / rojo) ──
-  function setSync(state, text) {
-    syncEl.className = "sync " + state;
-    syncEl.textContent = "● " + text;
-  }
+  function setSync(state, text) { syncEl.className = "sync " + state; syncEl.textContent = "● " + text; }
 
   function add(role, text) {
     const d = document.createElement("div");
@@ -149,33 +154,49 @@ textarea::placeholder{color:var(--text3)}
     return d;
   }
 
-  function setBusy(b) { input.disabled = b; btn.disabled = b; }
+  function setBusy(b) { input.disabled = b; btn.disabled = b; attach.disabled = b; }
 
-  // Un intento con timeout. Devuelve el JSON o lanza un Error con .status / .fatal
-  async function attempt(text, msgId) {
+  // ── Botones de opciones [[...]] ──
+  function clearOptions() { if (optionsEl) { optionsEl.remove(); optionsEl = null; } }
+  function showOptions(list) {
+    clearOptions();
+    if (!list || !list.length) return;
+    optionsEl = document.createElement("div");
+    optionsEl.className = "opts";
+    list.forEach((o) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "btn opt";
+      b.textContent = o;
+      b.onclick = () => pick(o);
+      optionsEl.appendChild(b);
+    });
+    chat.appendChild(optionsEl);
+    chat.scrollTop = chat.scrollHeight;
+  }
+  function pick(o) {
+    if (/subir un documento/i.test(o)) { fileInput.click(); return; } // abre el selector de archivos
+    sendText(o);
+  }
+
+  // ── Llamadas a la API con reintentos ──
+  async function attempt(request) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT);
     try {
-      const r = await fetch(API + "/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ thread_id: threadId, message: text, message_id: msgId }),
-        signal: ctrl.signal,
-      });
+      const { url, init } = request();
+      const r = await fetch(API + url, { ...init, signal: ctrl.signal });
       if (r.ok) return await r.json();
       let detail = "";
       try { detail = (await r.json()).detail || ""; } catch (_) {}
       const err = new Error(detail || "HTTP " + r.status);
       err.status = r.status;
-      err.fatal = [400, 422, 429].includes(r.status); // reintentar no sirve
+      err.fatal = [400, 413, 422, 429].includes(r.status); // reintentar no sirve
       throw err;
-    } finally {
-      clearTimeout(timer);
-    }
+    } finally { clearTimeout(timer); }
   }
 
-  // Reintenta con espera creciente (Render free tarda ~1 min en despertar)
-  async function callChat(text, msgId, typing) {
+  async function callApi(request, typing) {
     let lastErr;
     for (let i = 0; i < RETRY_DELAYS.length; i++) {
       if (RETRY_DELAYS[i]) {
@@ -183,75 +204,105 @@ textarea::placeholder{color:var(--text3)}
         setSync("saving", "Reconectando…");
         await sleep(RETRY_DELAYS[i]);
       }
-      try {
-        return await attempt(text, msgId);
-      } catch (e) {
-        lastErr = e;
-        if (e.fatal) throw e;
-        console.warn("Intento", i + 1, "falló:", e.status || e.name, e.message);
-      }
+      try { return await attempt(request); }
+      catch (e) { lastErr = e; if (e.fatal) throw e; console.warn("Intento", i + 1, "falló:", e.status || e.name, e.message); }
     }
     throw lastErr;
   }
 
-  function showError(e, text, msgId, silent) {
+  function showError(e, opts) {
     let msg = "No pude comunicarme con el servidor.";
     if (e.status === 429) msg = "Se alcanzó el límite de mensajes por hora. Probá más tarde.";
+    else if (e.status === 413 || e.status === 422) msg = e.message;
     else if (e.status >= 500) msg = "El servidor tuvo un problema procesando tu mensaje.";
     const d = add("bot", msg);
     d.classList.add("err");
-    const s = document.createElement("small");
-    s.textContent = "Detalle: " + (e.status ? "HTTP " + e.status + " – " : "") + (e.message || e.name);
-    d.appendChild(s);
-    if (e.status !== 429) {
+    if (e.status !== 413 && e.status !== 422) {
+      const s = document.createElement("small");
+      s.textContent = "Detalle: " + (e.status ? "HTTP " + e.status + " – " : "") + (e.message || e.name);
+      d.appendChild(s);
+    }
+    if (![413, 422, 429].includes(e.status)) {
       const b = document.createElement("button");
       b.type = "button";
       b.className = "btn primary";
       b.textContent = "Reintentar";
-      b.onclick = () => { d.remove(); send(text, { silent, id: msgId, retry: true }); };
+      b.onclick = () => { d.remove(); turn({ ...opts, retry: true }); };
       d.appendChild(b);
     }
   }
 
-  async function send(text, { silent = false, id = crypto.randomUUID(), retry = false } = {}) {
-    if (!silent && !retry) add("user", text);
+  // ── Un turno de conversación (texto o documento) ──
+  async function turn(opts) {
+    clearOptions();
+    if (opts.display && !opts.retry) add("user", opts.display);
     const typing = add("bot", "Escribiendo…");
     typing.classList.add("typing");
     setBusy(true);
     setSync("saving", "Pensando…");
     let done = false;
     try {
-      const j = await callChat(text, id, typing);
+      const j = await callApi(opts.request, typing);
       typing.remove();
       add("bot", j.reply);
       bar.style.width = Math.round(j.progress * 100) + "%";
-      label.textContent = j.done ? "Diagnóstico completo" : "Información relevada: " + Math.round(j.progress * 100) + "%";
-      setSync("ok", j.done ? "Completo" : "Conectado");
+      label.textContent = j.phase || "";
+      setSync("ok", j.done ? "Finalizado" : "Conectado");
+      showOptions(j.options);
       done = j.done;
     } catch (e) {
       typing.remove();
-      setSync("err", "Sin conexión");
-      showError(e, text, id, silent);
+      setSync("err", e.status === 422 || e.status === 413 ? "Conectado" : "Sin conexión");
+      showError(e, opts);
     }
-    if (done) { input.placeholder = "Entrevista finalizada"; return; }
+    if (done) { input.placeholder = "Relevamiento finalizado"; clearOptions(); return; }
     setBusy(false);
     input.focus();
   }
 
+  function sendText(text, { silent = false } = {}) {
+    const id = crypto.randomUUID();
+    turn({
+      display: silent ? null : text,
+      request: () => ({ url: "/chat", init: {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ thread_id: threadId, message: text, message_id: id }),
+      } }),
+    });
+  }
+
+  function sendFile(file) {
+    const id = crypto.randomUUID();
+    const fd = new FormData();
+    fd.append("thread_id", threadId);
+    fd.append("message_id", id);
+    fd.append("file", file);
+    turn({
+      display: "📎 " + file.name + " (" + Math.max(1, Math.round(file.size / 1024)) + " KB)",
+      request: () => ({ url: "/upload", init: { method: "POST", body: fd } }),
+    });
+  }
+
+  attach.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", () => {
+    const f = fileInput.files[0];
+    fileInput.value = "";
+    if (f) sendFile(f);
+  });
   form.addEventListener("submit", (e) => {
     e.preventDefault();
     const t = input.value.trim();
     if (!t) return;
     input.value = "";
-    send(t);
+    sendText(t);
   });
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
   });
 
-  // Despierta el servicio de Render apenas carga la página y arranca la entrevista
+  // Despierta el servicio de Render apenas carga la página y arranca el relevamiento
   fetch(API + "/health").catch(() => {});
-  send("Hola", { silent: true });
+  sendText("Hola", { silent: true });
 </script>
 </body>
 </html>

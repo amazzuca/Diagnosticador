@@ -1,29 +1,30 @@
-# Diagnosticador de automatización (LangGraph + FastAPI)
+# Relevador de procesos (LangGraph + FastAPI)
 
-Bot que entrevista a un cliente, releva 13 datos clave del proceso a automatizar y genera:
-- un diagnóstico preliminar para el cliente (se muestra en el chat)
-- un informe interno + score de lead (se envía por POST a un webhook de n8n)
+Bot que **detecta** procesos automatizables: entrevista al usuario (modo DEEP o Rápido), lee documentos
+que suba, y entrega (1) un resumen breve al usuario y (2) un informe oculto para el consultor.
 
-## Local
-    python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-    pip install -r requirements.txt
-    cp .env.example .env   # completar claves
-    export $(grep -v '^#' .env | xargs)   # Windows: cargar variables a mano o usar python-dotenv
-    uvicorn app.main:app --reload
-    # abrir http://localhost:8000
+## Estructura
+- `app/prompts/relevador.md`  → tu especificación (editable sin tocar código). Placeholders: `[NOMBRE DEL BOT]`, `[EMPRESA]`, `{{APRENDIZAJES_APROBADOS}}`.
+- `app/prompts/aprendizajes.md` → aprendizajes aprobados "a mano" (opcional).
+- `app/prompt.py`  → arma el system prompt + formato técnico del sistema.
+- `app/graph.py`   → grafo LangGraph, parseo de `<estado>` / botones `[[...]]`, blindaje de salida, informe del consultor.
+- `app/store.py`   → Postgres opcional: tablas `relevamientos` y `aprendizajes`.
+- `app/extract.py` → lectura de PDF, Word, Excel, CSV y TXT.
+- `app/main.py`    → API: `/chat`, `/upload`, `/health`, `/`.
 
-## Deploy en Render (free)
-1. Subir esta carpeta a un repo de GitHub.
-2. Render → New → Blueprint (usa render.yaml) o Web Service manual:
-   - Build: `pip install -r requirements.txt`
-   - Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-3. Cargar variables de entorno (ver .env.example): como mínimo la API key y MODEL.
-4. Deploy y abrir la URL pública.
+## Variables de entorno
+MODEL, OPENAI_API_KEY / ANTHROPIC_API_KEY, AGENCY_NAME, BRAND_LOGO, MAX_TURNS, RATE_LIMIT_PER_HOUR,
+N8N_WEBHOOK_URL, N8N_WEBHOOK_TOKEN, DATABASE_URL, ALLOWED_ORIGINS. Opcional: BOT_NAME.
 
-## Payload que recibe n8n (POST JSON)
-thread_id, datos{...13 campos}, resumen_cliente, informe_interno, score_viabilidad,
-complejidad, herramienta_recomendada, ahorro_horas_mes, calidad_lead
+## Eventos que recibe n8n (POST JSON, header X-Auth-Token; clave de upsert: `thread_id`)
+- `contacto_capturado`: apenas el usuario deja mail o teléfono (email, telefono, persona, estado).
+- `informe_consultor`: al cerrar (version, email, telefono, persona, estado, informe_consultor, mejoras_propuestas[]).
+- `informe_fallido`: si no se pudo generar el informe (trae el estado para no perder el relevamiento).
 
-## Personalización
-- Preguntas/campos: lista FIELDS en app/graph.py
-- Criterios de recomendación y formato del informe: REPORT_SYSTEM en app/graph.py
+## Automejora (aprobación del consultor)
+Con `DATABASE_URL`, las mejoras propuestas se guardan en `aprendizajes` con `status = 'pendiente'`.
+Para aprobarlas: Supabase → Table Editor → `aprendizajes` → cambiar `status` a `aprobada`.
+En ≤ 60 s el bot las incorpora en `{{APRENDIZAJES_APROBADOS}}`. Para descartarlas: `rechazada`.
+
+## Pruebas (LLM simulado, sin gastar tokens)
+    pip install pytest reportlab && pytest -q
